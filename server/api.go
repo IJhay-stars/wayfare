@@ -52,7 +52,18 @@ type Server struct {
 
 	// Timeout bounds a single corridor measurement. A full ladder is a
 	// dozen round trips to Horizon, so this is generous by HTTP standards.
+	// It is the ceiling: the budget a request actually gets is derived from
+	// its rung count (see budgetFor) and never exceeds this.
 	Timeout time.Duration
+
+	// Limiter bounds what each client can cost the service (issue #320). A
+	// live measurement is a dozen Horizon round trips, more with sizes=, and
+	// the free deployment has no platform rate limiting in front of it. Nil
+	// disables limiting, which keeps the zero-value Server's behaviour
+	// unchanged; wayfared installs one by default and -rate-limit=0 removes
+	// it. Tests that hammer one endpoint build their own Server or call
+	// NewRateLimiter with a disabled configuration.
+	Limiter *RateLimiter
 }
 
 // pkgLogger is the package-level logger for request and upstream logging.
@@ -76,15 +87,55 @@ func (s *Server) timeout() time.Duration {
 	return 90 * time.Second
 }
 
+// Live-measurement budget: a fixed allowance for the reference rate and
+// checks, plus a per-rung allowance for the Horizon round trips. The twelve
+// default rungs come to 82s, inside the 90s default ceiling.
+const (
+	budgetBase    = 10 * time.Second
+	budgetPerRung = 6 * time.Second
+)
+
+// budgetFor derives the time a live measurement of n rungs may take, capped
+// at the server's Timeout, so adding rungs adds time instead of timing out a
+// valid request by construction.
+func (s *Server) budgetFor(n int) time.Duration {
+	if n <= 0 {
+		n = len(route.DefaultSizes)
+	}
+	b := budgetBase + time.Duration(n)*budgetPerRung
+	if ceiling := s.timeout(); b > ceiling {
+		return ceiling
+	}
+	return b
+}
+
 // Handler returns the routed handler for the whole service.
+//
+// The limiter wraps every route, including /healthz: a deployment probe and
+// a browser page load are both requests a client chose to make, and the
+// free instance's cost is upstream calls plus CPU regardless of path. CORS
+// stays outermost so a rate-limited response still carries the origin
+// policy and remains readable to a browser client.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/corridor", s.handleCorridor)
 	mux.HandleFunc("/api/corridor/trend", s.handleTrend)
+	mux.HandleFunc("/api/chain-heads", s.handleChainHeads)
 	mux.HandleFunc("/api/assets", s.handleAssets)
+	mux.HandleFunc("/api/market-structure", s.handleMarketStructure)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.Handle("/", uiHandler())
-	return withCORS(mux)
+	return withCORS(s.limit(mux))
+}
+
+// limit applies the configured rate limiter, or passes through unchanged
+// when none is set. The nil case is the zero-value Server: every existing
+// constructor that does not mention limiting keeps its old behaviour.
+func (s *Server) limit(next http.Handler) http.Handler {
+	if s.Limiter == nil {
+		return next
+	}
+	return s.Limiter.middleware(next)
 }
 
 // withCORS makes the API callable from any origin, and records the policy
@@ -191,7 +242,13 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		// a first deploy with an empty chain should still answer.
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
+	rungs := len(sizes)
+	if rungs == 0 {
+		rungs = len(route.DefaultSizes)
+	}
+	budget := s.budgetFor(rungs)
+	w.Header().Set("X-Measurement-Budget", budget.String())
+	ctx, cancel := context.WithTimeout(r.Context(), budget)
 	defer cancel()
 
 	res, err := s.Engine.Ladder(ctx, route.LadderRequest{
@@ -231,8 +288,21 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusBadGateway
 		code := codeMeasurementFailed
 		if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-			code = codeUpstreamTimeout
+			completed := []string{}
+			if res != nil {
+				for _, d := range res.CompletedSizes() {
+					completed = append(completed, d.String())
+				}
+			}
+			writeJSON(w, r, http.StatusGatewayTimeout, map[string]any{
+				"error": fmt.Sprintf("measuring corridor: timed out after %s with %d of %d rungs completed",
+					budget, len(completed), rungs),
+				"code":            codeUpstreamTimeout,
+				"budget":          budget.String(),
+				"rungs_requested": rungs,
+				"rungs_completed": completed,
+			})
+			return
 		}
 		writeError(w, r, status, code, "measuring corridor: "+err.Error())
 		return
@@ -385,14 +455,85 @@ type healthCorridorJSON struct {
 	AgeHuman   string `json:"age_human"`
 }
 
+// chainHeadBudget bounds the Horizon root lookup inside /healthz. The health
+// endpoint must stay cheap and fast for deployment probes, so a slow chain
+// head becomes an unknown after this budget rather than a slow answer.
+const chainHeadBudget = 5 * time.Second
+
+// healthFreshnessJSON is the cross-corridor freshness block on /healthz:
+// chain head, newest stored record and total record count, so a reader can
+// tell how old the served data is without parsing any corridor response
+// (backlog #257 / issue #311).
+//
+// Every field is a pointer because every field can be unknown, and unknown
+// is never rendered as zero: a nil chain_head means "could not ask Horizon",
+// not ledger 0; a nil newest_record_at means the store holds nothing or
+// could not be read, not "now".
+type healthFreshnessJSON struct {
+	ChainHead      *int64  `json:"chain_head"`
+	NewestRecordAt *string `json:"newest_record_at"`
+	RecordCount    *int64  `json:"record_count"`
+}
+
+// healthFreshness assembles the freshness block. The store is small by
+// construction — the run window is capped by rotation — so reading the full
+// history for a count is deliberate rather than something to optimise away.
+func (s *Server) healthFreshness(ctx context.Context) healthFreshnessJSON {
+	f := healthFreshnessJSON{}
+
+	if s.Engine != nil && s.Engine.DEX != nil {
+		headCtx, cancel := context.WithTimeout(ctx, chainHeadBudget)
+		defer cancel()
+		if head, err := s.Engine.DEX.ChainHead(headCtx); err == nil {
+			f.ChainHead = &head
+		} else {
+			log().Debug("healthz: chain head unavailable, reporting unknown", "error", err)
+		}
+	}
+
+	if s.Store != nil {
+		corridors, err := s.Store.Corridors(ctx)
+		if err != nil {
+			log().Debug("healthz: corridor listing failed, reporting unknown", "error", err)
+			return f
+		}
+		var count int64
+		var newest time.Time
+		for _, c := range corridors {
+			recs, err := s.Store.All(ctx, c)
+			if err != nil {
+				// A partial count of an unknown total would be a fabricated
+				// figure; one unreadable corridor makes the whole block's
+				// store-derived fields unknown.
+				log().Debug("healthz: corridor history unreadable, reporting unknown",
+					"corridor", c, "error", err)
+				return f
+			}
+			count += int64(len(recs))
+			for _, r := range recs {
+				if r.RecordedAt.After(newest) {
+					newest = r.RecordedAt
+				}
+			}
+		}
+		f.RecordCount = &count
+		if !newest.IsZero() {
+			ts := newest.UTC().Format(time.RFC3339)
+			f.NewestRecordAt = &ts
+		}
+	}
+	return f
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := checkParams(r, "pretty"); err != nil {
 		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
 	}
 	writeJSON(w, r, http.StatusOK, map[string]any{
-		"status": "ok",
-		"data":   s.healthData(r.Context()),
+		"status":    "ok",
+		"data":      s.healthData(r.Context()),
+		"freshness": s.healthFreshness(r.Context()),
 	})
 }
 
@@ -415,6 +556,7 @@ const (
 	codeInvalidLimit        = "invalid_limit"
 	codeStoreRead           = "store_read_error"
 	codeDivergenceHistory   = "divergence_history_error"
+	codeRateLimited         = "rate_limited"
 )
 
 // checkParams rejects any query parameter outside the endpoint's allow-list.
@@ -844,4 +986,65 @@ func humanAge(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
+}
+
+// MarketStructureJSON is the wire shape for the market structure endpoint.
+// It reports issuer concentrations — cases where a single issuer backs
+// multiple corridor destination tokens. This is a structural fact about the
+// corridor set, not a measurement, and it does not change between runs.
+type MarketStructureJSON struct {
+	// IssuerConcentrations maps each issuer account ID to the list of
+	// corridor asset codes it issues. Only issuers with two or more
+	// corridors are included.
+	IssuerConcentrations map[string][]string `json:"issuer_concentrations"`
+
+	// CorridorCount is the total number of registered corridor destinations
+	// (assets with a fiat peg, excluding USDC).
+	CorridorCount int `json:"corridor_count"`
+
+	// ConcentratedCorridorCount is the number of corridors that share an
+	// issuer with at least one other corridor.
+	ConcentratedCorridorCount int `json:"concentrated_corridor_count"`
+
+	// GeneratedAt is when this analysis was produced.
+	GeneratedAt string `json:"generated_at"`
+}
+
+// handleMarketStructure serves the market structure analysis.
+// It is a read endpoint that computes issuer concentrations from the
+// verified asset registry. No store or live measurement is required.
+func (s *Server) handleMarketStructure(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET is supported")
+		return
+	}
+	if err := checkParams(r, "pretty"); err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
+		return
+	}
+
+	concentration := asset.IssuerConcentration()
+
+	// Count total corridor destinations (assets with a peg, excluding USDC).
+	corridorCount := 0
+	for _, e := range asset.Registry() {
+		if e.Code != "USDC" && e.Peg != "" {
+			corridorCount++
+		}
+	}
+
+	// Count corridors that are in a concentration.
+	concentratedCount := 0
+	for _, corridors := range concentration {
+		concentratedCount += len(corridors)
+	}
+
+	out := MarketStructureJSON{
+		IssuerConcentrations:      concentration,
+		CorridorCount:             corridorCount,
+		ConcentratedCorridorCount: concentratedCount,
+		GeneratedAt:               time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSON(w, r, http.StatusOK, out)
 }
