@@ -35,6 +35,11 @@ type QuoteJSON struct {
 	LossAmount    string   `json:"loss_amount,omitempty"`
 	Verdict       string   `json:"verdict"`
 	Warnings      []string `json:"warnings"`
+	// PathCount is how many distinct paths priced at the rung that produced
+	// this quote. It duplicates RungJSON.path_count so both shapes carry the
+	// same fragmentation fact; the intent is that the field is most useful on
+	// a quote a client already printed and does not want to re-derive it.
+	PathCount     int      `json:"path_count,omitempty"`
 }
 
 // CostPartJSON is one component of a rung's effective transfer cost.
@@ -82,6 +87,11 @@ type RungJSON struct {
 	Priced       bool           `json:"priced"`
 	Integrity    string         `json:"integrity"`
 	Quote        *QuoteJSON     `json:"quote"`
+	// PathCount is how many distinct paths priced at this rung. It is
+	// redundant with quote.path_count but lives here so a client that only
+	// wants the fragmentation signal does not need to walk into every quote.
+	PathCount    int            `json:"path_count"`
+	Alternatives []QuoteJSON    `json:"alternatives,omitempty"`
 	Cost         *CostBlockJSON `json:"cost,omitempty"`
 	Notes        []string       `json:"notes"`
 	Error        string         `json:"error,omitempty"`
@@ -236,7 +246,41 @@ func ToQuoteJSON(q *Quote) *QuoteJSON {
 		LossAmount:    q.LossAmount.StringFixed(2),
 		Verdict:       q.Verdict.String(),
 		Warnings:      w,
+		PathCount:     1,
 	}
+}
+
+// toAlternatives renders every priced quote except the best as a bounded
+// list beside it. count is len(r.Result.Quotes); best is that slice's
+// first element after the sort in route.Quote.
+func toAlternatives(quotes []Quote, best *Quote) []QuoteJSON {
+	if len(quotes) <= 1 {
+		return nil
+	}
+	out := make([]QuoteJSON, 0, len(quotes)-1)
+	for i := 1; i < len(quotes); i++ {
+		q := &quotes[i]
+		out = append(out, QuoteJSON{
+			Kind:          string(q.Kind),
+			Description:   q.Description,
+			Source:        q.Source,
+			ReceiveAmount: q.ReceiveAmount.String(),
+			EffectiveRate: q.EffectiveRate.String(),
+			LossPct:       q.LossPct.String(),
+			LossAmount:    q.LossAmount.StringFixed(2),
+			Verdict:       q.Verdict.String(),
+			Warnings:      nilOnEmpty(q.Warnings),
+			PathCount:     len(quotes),
+		})
+	}
+	return out
+}
+
+func nilOnEmpty(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	return ss
 }
 
 // ToCostBlockJSON renders a decomposition for the wire.
@@ -358,9 +402,12 @@ func ToCorridorJSON(l *LadderResult, pair string) CorridorJSON {
 			if r.Result.Notes != nil {
 				rj.Notes = r.Result.Notes
 			}
-			if len(r.Result.Quotes) > 0 {
-				rj.Quote = ToQuoteJSON(&r.Result.Quotes[0])
-			}
+		if len(r.Result.Quotes) > 0 {
+			best := &r.Result.Quotes[0]
+			rj.Quote = ToQuoteJSON(best)
+			rj.PathCount = len(r.Result.Quotes)
+			rj.Alternatives = toAlternatives(r.Result.Quotes, best)
+		}
 		}
 		if len(r.Decomposition.Parts) > 0 {
 			rj.Cost = ToCostBlockJSON(r.Decomposition)
