@@ -282,9 +282,12 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*Profile, error)
 		return nil, fmt.Errorf("anchor: %s returned HTTP %d for stellar.toml", domain, resp.StatusCode)
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxTOMLBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxTOMLBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("anchor: reading stellar.toml for %s: %w", domain, err)
+	}
+	if len(raw) > maxTOMLBytes {
+		return nil, fmt.Errorf("anchor: stellar.toml for %s exceeds the %d-byte limit", domain, maxTOMLBytes)
 	}
 
 	var t TOML

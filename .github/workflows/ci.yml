@@ -37,7 +37,7 @@ permissions:
 # deliberate decision, not a quiet bump: #467 deliberately returned CI to 1.22,
 # and staying there would keep carrying known-bad stdlib advisories.
 env:
-  GO_VERSION: "1.27.2"
+  GO_VERSION: "1.27.3"
 
 jobs:
   build:
@@ -50,9 +50,9 @@ jobs:
     env:
       TZ: ${{ matrix.timezone }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -77,11 +77,25 @@ jobs:
       - name: go build
         run: go build ./...
 
+  # No job goes without an explicit timeout (#573). GitHub's default ceiling is
+  # six hours; these numbers come from observed durations on GitHub-hosted
+  # runners, sampled across a week of runs, and leave headroom for a cold or
+  # contended runner rather than being chosen at random.
+  #
+  # This job is a needs-gate: it runs a single `test` against needs.build's
+  # aggregated result, and exits as soon as the matrix resolves — measured
+  # check-run spans are 2–4s with a ~4s runner-scheduling tail, so the job is
+  # bounded by the matrix above, whose slowest run finishes in under 10 minutes
+  # (typical axes complete in <1; the worst observed is <3m under cold caches).
+  # The floor of 1m covers the runner and steps alone; 10 matches the matrix's
+  # own timeout, so the gate can never hold a finished branch open longer than
+  # the work it is gating is known to take.
   build-and-test:
     name: build and test
     needs: build
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: require all timezone runs to pass
         run: test "${{ needs.build.result }}" = success
@@ -91,9 +105,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -101,8 +115,8 @@ jobs:
 
       # Build from source with the configured Go toolchain: the prebuilt
       # golangci-lint binary is built with an older Go version and rejects
-      # this module's Go 1.27.2 target.
-      - uses: golangci/golangci-lint-action@v7
+      # this module's Go 1.27.3 target.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.15.0
           install-mode: goinstall
@@ -117,9 +131,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -165,9 +179,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -198,7 +212,7 @@ jobs:
       # rather than gated, because a job that is always red teaches people to
       # ignore it.
       - name: report known vulnerabilities in the image
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: v0.74.0
           scan-type: image
@@ -217,7 +231,7 @@ jobs:
       # available patch cannot be acted on, and failing on it would block every
       # pull request while announcing nothing new.
       - name: fail on a fixable vulnerability in the image's packages
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: v0.74.0
           scan-type: image
@@ -228,3 +242,30 @@ jobs:
           ignore-unfixed: true
           format: table
           exit-code: "1"
+
+      # The scanner reports findings; an SBOM is the same inventory in a form a
+      # downstream consumer can scan for themselves, against their own advisory
+      # sources. It is emitted by the scanner the two steps above already use,
+      # pinned to the same release, so the manifest describes the image this job
+      # built and cannot drift from what was scanned.
+      #
+      # exit-code 0 because a report is not a gate: the gate is the step above.
+      - name: generate an SBOM for the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          scan-type: image
+          image-ref: wayfare:ci
+          format: cyclonedx
+          output: wayfare.cyclonedx.json
+          exit-code: "0"
+
+      # Attached to the run so the SBOM outlives the workspace, which the
+      # runner discards. A build that somehow produces no manifest fails here
+      # rather than publishing an empty artifact.
+      - name: upload the SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: wayfare.cyclonedx.json
+          if-no-files-found: error

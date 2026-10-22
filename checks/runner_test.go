@@ -2,7 +2,10 @@ package checks
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -252,6 +255,103 @@ func TestRunnerUnresolvableAnchorKeepsChecksRunning(t *testing.T) {
 	}
 }
 
+func TestRunnerHostileTOMLIsUndetermined(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		timeout time.Duration
+	}{
+		{
+			name: "oversized",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, strings.Repeat("x", 100*1024+1024))
+			},
+		},
+		{
+			name: "streaming",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				flusher := w.(http.Flusher)
+				for r.Context().Err() == nil {
+					if _, err := io.WriteString(w, strings.Repeat("x", 4096)); err != nil {
+						return
+					}
+					flusher.Flush()
+				}
+			},
+		},
+		{
+			name: "slow-loris",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				flusher := w.(http.Flusher)
+				ticker := time.NewTicker(20 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						if _, err := io.WriteString(w, "x"); err != nil {
+							return
+						}
+						flusher.Flush()
+					}
+				}
+			},
+			timeout: 100 * time.Millisecond,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(tc.handler)
+			defer server.Close()
+			target, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := server.Client()
+			client.Transport = hostRewriteTransport{base: client.Transport, target: target}
+			client.Timeout = tc.timeout
+
+			independent := Descriptor{ID: "test.independent", Title: "independent check",
+				CanDetermine: "the check runs", CannotDetermine: "the check does not run"}
+			runner := &Runner{
+				Checks: []Check{
+					AnchorAssetISO4217{},
+					stubCheck{id: independent.ID, result: Pass(independent, Subject{}, "ran")},
+				},
+				Resolver: &anchor.Resolver{HTTPClient: client},
+			}
+			findings := runner.ForAsset(ctx(), asset.NGNC())
+			if len(findings.Checks) != 2 {
+				t.Fatalf("runner returned %d checks, want both checks to run", len(findings.Checks))
+			}
+			if result := findings.Checks[0]; result.Determined || result.Failed() || result.Reason == "" {
+				t.Errorf("anchor check = determined %v, failed %v, reason %q; want undetermined with a reason",
+					result.Determined, result.Failed(), result.Reason)
+			}
+			if !findings.Checks[1].Passed {
+				t.Error("resolution failure stopped the independent check from running")
+			}
+		})
+	}
+}
+
+type hostRewriteTransport struct {
+	base   http.RoundTripper
+	target *url.URL
+}
+
+func (t hostRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	urlCopy := *req.URL
+	urlCopy.Scheme = t.target.Scheme
+	urlCopy.Host = t.target.Host
+	clone.URL = &urlCopy
+	clone.Host = t.target.Host
+	return t.base.RoundTrip(clone)
+}
+
 // TestRunnerTimeoutBoundsTheSweep pins that the whole sweep for one corridor
 // is bounded: a check that would outlive the runner's timeout is cancelled by
 // the context the runner derives, and reports undetermined with the cause
@@ -331,6 +431,10 @@ func TestRunnerHandsTheClientToDefaultChecks(t *testing.T) {
 		case SEP24InfoListsAsset:
 			if c.HTTPClient != client {
 				t.Error("SEP24InfoListsAsset did not receive the runner's client")
+			}
+		case SEP6InfoListsAsset:
+			if c.HTTPClient != client {
+				t.Error("SEP6InfoListsAsset did not receive the runner's client")
 			}
 		case IssuerAuthFlags:
 			if c.HTTPClient != client {
