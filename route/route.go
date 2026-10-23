@@ -192,6 +192,16 @@ type Quote struct {
 	Description string // e.g. "USDC -> XLM -> NGNC"
 	Source      string // anchor domain, or "stellar-dex"
 
+	// Hops are the intermediate assets the priced path routes through, in
+	// execution order, between SendAsset and ReceiveAsset. Empty means a
+	// direct market — the same fact dex.Path.Hops records, carried onto
+	// the quote because Description cannot carry it: the arrow-joined
+	// string is display text, and an asset code identifies nothing
+	// without its issuer. The full path in execution order is SendAsset,
+	// then Hops, then ReceiveAsset; QuoteJSON.Hops publishes exactly that
+	// sequence (backlog #84, issue #100).
+	Hops []asset.Asset
+
 	SendAsset     asset.Asset
 	SendAmount    decimal.Decimal
 	ReceiveAsset  asset.Asset
@@ -216,6 +226,12 @@ type Quote struct {
 	LossAmount decimal.Decimal
 
 	Verdict Verdict
+
+	// PathCount is the number of distinct routes Horizon returned for this
+	// size. The value is published alongside the selected quote so a client
+	// can tell whether a route was unique or part of a fragmented market,
+	// without re-deriving it from the raw Horizon response.
+	PathCount int
 
 	// Warnings are conditions the user must see before acting.
 	Warnings []string
@@ -316,7 +332,11 @@ func (r *Result) Viable() bool { return r.Recommended != nil }
 
 // Engine prices and ranks routes.
 type Engine struct {
-	DEX     *dex.Client
+	// DEX is the pathfinder the engine prices against. It is an interface so
+	// the Horizon client can be replaced without changing route; nil leaves
+	// the on-chain leg unpriced. See Pathfinder for the full-set and AMM
+	// requirements its implementation must satisfy.
+	DEX     Pathfinder
 	RefRate refrate.Provider
 
 	// Parallel is an optional parallel/street-market rate source, reported as
@@ -535,6 +555,14 @@ func unknownHopNote(unknown []asset.Asset) []string {
 // classification: an unknown hop is treated exactly like a bridge hop, which
 // is the known, bounded false-negative documented in asset/known.go. It is
 // returned so the caller can surface it rather than let it stay silent.
+func distinctPathCount(paths []dex.Path) int {
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		seen[p.Describe()] = struct{}{}
+	}
+	return len(seen)
+}
+
 func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset, []asset.Asset) {
 	if len(paths) == 0 {
 		return IntegrityNoMarket, nil, nil
@@ -614,10 +642,12 @@ func (e *Engine) quoteDEX(ctx context.Context, req Request, ref refrate.Rate) (*
 		Kind:          KindDEX,
 		Description:   best.Describe(),
 		Source:        "stellar-dex",
+		Hops:          best.Hops,
 		SendAsset:     req.SendAsset,
 		SendAmount:    req.SendAmount,
 		ReceiveAsset:  req.ReceiveAsset,
 		ReceiveAmount: best.DestAmount,
+		PathCount:     distinctPathCount(paths),
 		QuotedAt:      time.Now(),
 	}
 	q.score(ref.Mid, ref.Source)

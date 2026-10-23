@@ -107,7 +107,10 @@ type LadderResult struct {
 	Parallel *refrate.Parallel
 
 	// Floor is the loss percentage at the smallest size priced. It
-	// approximates the corridor's cost with price impact removed.
+	// approximates the corridor's cost with price impact removed. The
+	// same floor is the baseline every priced rung's slippage is
+	// measured against — see LadderResult.decomposeSlippage for why
+	// this size is the floor and what slippage means on top of it.
 	Floor decimal.Decimal
 
 	// FloorSize is the size Floor was measured at.
@@ -257,6 +260,17 @@ func (l *LadderResult) PartiallyFailed() bool {
 	return unmeasured > 0 && unmeasured < len(l.Rungs)
 }
 
+// CompletedSizes names the send amounts that were priced, in ascending order.
+func (l *LadderResult) CompletedSizes() []decimal.Decimal {
+	var out []decimal.Decimal
+	for _, r := range l.Rungs {
+		if r.Priced() {
+			out = append(out, r.SendAmount)
+		}
+	}
+	return out
+}
+
 // UnmeasuredSizes names the send amounts at which nothing was learned, in
 // ascending order. Empty means every size produced information about the
 // corridor.
@@ -316,7 +330,10 @@ func (e *Engine) Ladder(ctx context.Context, req LadderRequest) (*LadderResult, 
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		// The partial result is returned alongside the error so a caller can
+		// report which rungs finished (CompletedSizes). It is not summarised
+		// and must not be presented as a measurement.
+		return out, err
 	}
 	out.summarise()
 	return out, nil
@@ -475,6 +492,12 @@ func (l *LadderResult) summarise() {
 	default:
 		l.Integrity = IntegrityUnknown
 	}
+
+	// Slippage is a ladder-level quantity: each priced rung's
+	// decomposition carries the excess loss over the floor the loop
+	// above established, and the floor rung's own slippage is a
+	// measured zero. decomposeSlippage documents the definition.
+	l.decomposeSlippage()
 
 	l.Curve = l.buildCurve()
 	l.computeMarginalCosts()
